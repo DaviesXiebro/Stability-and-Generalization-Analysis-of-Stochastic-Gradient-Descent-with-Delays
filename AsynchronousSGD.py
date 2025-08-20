@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Sampler, random_split
 import torchvision.transforms as transforms
@@ -172,7 +173,7 @@ def hinge_loss(pred, target, q=1.5):
     return loss.mean()
 
 class Linear_RCV1(nn.Module):
-    def __init__(self, loss='mse',q=None):
+    def __init__(self, loss='mse',q=1.5):
         super(Linear_RCV1, self).__init__()
         self.fc1 = nn.Linear(47236, 2)
         nn.init.constant_(self.fc1.weight, 0.01)
@@ -192,12 +193,63 @@ class Linear_RCV1(nn.Module):
         loss = self.loss(output, target)
         return output, loss
     
+class Linear_GISETTE(nn.Module):
+    def __init__(self, loss='mse',q=1.5):
+        super(Linear_GISETTE, self).__init__()
+        self.fc1 = nn.Linear(5000, 2)
+        nn.init.constant_(self.fc1.weight, 0.01)
+        nn.init.constant_(self.fc1.bias, 0.01)
+        if loss == 'mse':
+            self.loss = lambda pred, target: mse_loss(pred, target)
+        elif loss == 'hingeloss':
+            if q is None:
+                raise ValueError("q must be specified for hinge loss")
+            self.loss = lambda pred, target: hinge_loss(pred, target, q)
+        else:
+            raise ValueError("Unsupported loss function. Use 'mse' or 'hingeloss'.")
+
+    def forward(self, x, target):
+        output = self.fc1(x)
+        loss = self.loss(output, target)
+        return output, loss
+    
+class FCNET_MNIST(nn.Module):
+    def __init__(self, loss='mse',q=1.5):
+        super(FCNET_MNIST, self).__init__()
+        self.fc1 = nn.Linear(32*32, 512)
+        self.fc2 = nn.Linear(512, 128)
+        self.fc3 = nn.Linear(128, 10)
+        for layer in [self.fc1, self.fc2, self.fc3]:
+            nn.init.constant_(layer.weight, 0.01)
+            nn.init.constant_(layer.bias, 0.01)
+        if loss == 'mse':
+            self.loss = lambda pred, target: mse_loss(pred, target)
+        elif loss == 'hingeloss':
+            if q is None:
+                raise ValueError("q must be specified for hinge loss")
+            self.loss = lambda pred, target: hinge_loss(pred, target, q)
+        else:
+            raise ValueError("Unsupported loss function. Use 'mse' or 'hingeloss'.")
+
+    def forward(self, x, target):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        output = self.fc3(x)
+        loss = self.loss(output, target)
+        return output, loss
+    
 def load_model(model_name, loss='mse', q=None):
     if model_name == 'linear_rcv1':
         model = Linear_RCV1(loss=loss, q=q)
         return model
+    elif model_name == 'linear_gisette':
+        model = Linear_GISETTE(loss=loss, q=q)
+        return model
+    elif model_name == 'fcnet_mnist':
+        model = FCNET_MNIST(loss=loss, q=q)
+        return model
     else:
-        raise ValueError("Unsupported model name. Use 'linear_rcv1'.")
+        raise ValueError("Unsupported model name. Use 'linear_rcv1' or 'linear_gisette', 'fcnet_mnist'.")
     
 ############################
 # Data preparation
@@ -298,11 +350,12 @@ class ProgressMeter:
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 class Logger:
-    def __init__(self, log_dir):
+    def __init__(self, log_dir, model_name='', dataset_name='', loss_name='', lr=0.01, delay=0, bs=1):
         self.log_dir = log_dir
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
-        self.file_path = os.path.join(log_dir, 'log.txt')
+        self.filename = f"log_{model_name}_{dataset_name}_{loss_name}_lr{lr:.0e}_bs{bs}_delay{delay}.txt"
+        self.file_path = os.path.join(log_dir, self.filename)
 
     def update(self, iteration, delay, train_loss, test_loss, stability):
         with open(self.file_path, 'a') as f:
@@ -311,31 +364,78 @@ class Logger:
     def savelog(self):
         pass
 
-# Server
+class DataRecorder:
+    def __init__(self, rec_dir='', model_name='', dataset_name='', loss_name='', lr=0.01, delay=0, bs=1):
+        self.rec_dir = rec_dir
+        if not os.path.exists(rec_dir):
+            os.makedirs(rec_dir)
+        self.filename = f"{model_name}_{dataset_name}_{loss_name}_lr{lr:.0e}_bs{bs}_delay{delay}.pth"
+        self.data = {'iteration': [],
+                     'delay': [],
+                     'train_loss': [],
+                     'test_loss': [],
+                     'stability': []}
+        
+    def update(self, iteration, delay, train_loss, test_loss, stability):
+        self.data['iteration'].append(iteration)
+        self.data['delay'].append(delay)
+        self.data['train_loss'].append(train_loss)
+        self.data['test_loss'].append(test_loss)
+        self.data['stability'].append(stability)
+
+    def save(self):
+        filepath = os.path.join(self.rec_dir, self.filename)
+        torch.save(self.data, filepath)
+        print(f"Data saved to {filepath}")
+
+class ModelCheckpoint:
+    def __init__(self, checkpoint_dir, filename='model'):
+        self.checkpoint_dir =  checkpoint_dir
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+        self.filename = filename
+
+    def save(self, model, iteration, suffix=''):
+        self.filename= f"{self.filename}_iter{iteration}_{suffix}.pth"
+        self.filepath = os.path.join(self.checkpoint_dir, self.filename)
+        torch.save(model.state_dict(), self.filepath)
+        print(f"Model saved to {self.filepath} at iteration {iteration}")
+
+############################
+# Server class
+############################
 class Server:
-    def __init__(self, device='cuda', train_type='fixed', num_workers=1, batch_size=1, dataset_name=None, dataset_path=None, model_name=None, iterations=0, evaluation_time=0, log_dir=None):
+    def __init__(self, device='cuda', train_type='fixed', num_workers=1, batch_size=1,
+                  dataset_name=None, dataset_path=None, model_name=None, loss_name='mse', lr=0.01, 
+                  iterations=0, evaluation_time=0, log_dir=None, checkpoint_dir=None, rec_dir=None):
         # train_type = 'fixed' or 'random'
-        # if 'fixed', the delay factor = num_workers - 1
         self.device = device
         self.train_type = train_type
         self.num_workers = num_workers
         self.dataset_name = dataset_name
         self.dataset_path = dataset_path
         self.model_name = model_name
+        self.loss_name = loss_name
+        self.lr=lr
         self.iterations = iterations
         self.evaluation_time = evaluation_time
-        self.logger = Logger(log_dir)
-        self.iteration = 1
         self.batch_size = batch_size
+        self.logger = Logger(log_dir, model_name=model_name, dataset_name=dataset_name,
+                            loss_name=loss_name, lr=lr, delay=num_workers-1, bs=batch_size)
+        self.checkpoint = ModelCheckpoint(checkpoint_dir, model_name)
+        self.datarecorder = DataRecorder(rec_dir=rec_dir, model_name=model_name, dataset_name=dataset_name,
+                                          loss_name=loss_name, lr=lr, delay=num_workers-1, bs=batch_size)
+        self.iteration = 1 #iteration starts from 1
+        self.delay = 0 # delay factor: if train_type ='fixed', the delay factor = num_workers - 1
 
         # Load datasets and models
         self.train_dataset = load_data(dataset_name, dataset_path, 'train')
         self.test_dataset = load_data(dataset_name, dataset_path, 'test')
         self.neighbor_dataset = create_neibordataset(self.train_dataset)
-        self.model1 = load_model(model_name, 'mse')
-        self.model2 = load_model(model_name, 'mse')
-        self.optimizer1 = optim.SGD(self.model1.parameters(), lr=0.01)
-        self.optimizer2 = optim.SGD(self.model2.parameters(), lr=0.01)
+        self.model1 = load_model(self.model_name, self.loss_name)
+        self.model2 = load_model(self.model_name, self.loss_name)
+        self.optimizer1 = optim.SGD(self.model1.parameters(), lr=self.lr)
+        self.optimizer2 = optim.SGD(self.model2.parameters(), lr=self.lr)
 
         # Set device
         if self.device == 'cuda':
@@ -434,8 +534,15 @@ class Server:
         stability = self.stability_calculate()
         avg_train_loss = (train_loss1 + train_loss2) / 2
         avg_test_loss = (test_loss1 + test_loss2) / 2
-        print(f"Iteration: {self.iteration}, Delay: {self.delay:.1f}, Avg Train Loss: {avg_train_loss:.4f}, Avg Test Loss: {avg_test_loss:.4f}, Stability: {stability:.4f}")
+        print(f"Iteration: {self.iteration}, Delay: {self.delay:.0f}, Avg Train Loss: {avg_train_loss:.6f}, Avg Test Loss: {avg_test_loss:.6f}, Stability: {stability:.6f}")
         self.logger.update(self.iteration, self.delay, avg_train_loss, avg_test_loss, stability)
+        self.datarecorder.update(self.iteration, self.delay, avg_train_loss, avg_test_loss, stability)
+        if self.iteration == self.iterations:
+            self.datarecorder.save()
+            if test_loss1 < test_loss2:
+                self.checkpoint.save(self.model1, self.iteration, suffix='M1')
+            else:
+                self.checkpoint.save(self.model2, self.iteration, suffix='M2')
 
     def evaluate(self, model, dataset):
         dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
@@ -457,16 +564,23 @@ class Server:
         diff_norm = sum(torch.norm(params1[name] - params2[name]).item() ** 2 for name in params1.keys()) ** 0.5
         return diff_norm
 
-# Worker
+############################
+# Worker class
+############################
 class Worker:
     def __init__(self, worker_id, bs, distributed_datasets, server):
         self.worker_id = worker_id
         self.active = True
         self.iteration_last = 0
         self.batch_size = bs
-        # self.gradient = {'model1': [], 'model2': []}
         self.server = server
-        self.models = {'model1': server.model1, 'model2': server.model2}
+        self.device = server.device
+        # self.gradient = {'model1': [], 'model2': []}
+        self.model1 = load_model(server.model_name, server.loss_name)
+        self.model2 = load_model(server.model_name, server.loss_name)
+        self.model1.to(self.device)
+        self.model2.to(self.device)
+        self.models = {'model1': self.model1, 'model2': self.model2}
         self.ini_seed = 0
         self.samplers = {
                 'model1': DistributedSampler(distributed_datasets[0][worker_id], worker_id=self.worker_id, seed=self.ini_seed),
@@ -480,7 +594,6 @@ class Worker:
                 'model1': enumerate(self.dataloaders['model1']),
                 'model2': enumerate(self.dataloaders['model2'])
             }
-        self.device = server.device
 
     def next_data(self, model_name):
         try:
@@ -511,21 +624,30 @@ class Worker:
         self.models['model2'].load_state_dict(model2_state_dict)
         self.active = True
 
-# main function to run the server
+############################
+# Main function
+############################
 if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
-    num_workers = 6
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_type = 'fixed'  # or 'random' 
-    dataset_name = 'rcv1'  # or 'cifar10', 'mnist', 'gisette'
+    num_workers = 6
+    dataset_name = 'gisette'  # or 'rcv1', 'cifar10', 'mnist', 'gisette'
     dataset_path = './data'
-    model_name = 'linear_rcv1'
-    iterations = 30000
+    model_name = 'linear_gisette' # or 'linear_rcv1', 'linear_gisette', 'fcnet_mnist'
+    loss_name = 'mse'  # or 'hingeloss'
+    lr = 2e-5
+    iterations = 6000
     batch_size = 16
-    evaluation_time = 3000
+    evaluation_time = 60  # Evaluate every 60 iterations
     log_dir = './logs'
+    checkpoint_dir = './checkpoints'
+    rec_dir = './records'
+
 
     server = Server(device=device, train_type=train_type, num_workers=num_workers, batch_size=batch_size, dataset_name=dataset_name,
-                     dataset_path=dataset_path, model_name=model_name, iterations=iterations, evaluation_time=evaluation_time, log_dir=log_dir)
+                     dataset_path=dataset_path, model_name=model_name, loss_name=loss_name, lr=lr,
+                     iterations=iterations, evaluation_time=evaluation_time, log_dir=log_dir,checkpoint_dir=checkpoint_dir,
+                     rec_dir=rec_dir)
     server.train()
