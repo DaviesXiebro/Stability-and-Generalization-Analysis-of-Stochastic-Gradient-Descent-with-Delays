@@ -61,6 +61,10 @@ class LibSVMDataset(torch.utils.data.Dataset):
     @property
     def num_features(self):
         return self.data.shape[1]
+    
+    @property
+    def num_samples(self):
+        return self.data.shape[0]
 
     def __getitem__(self, idx):
         if self._is_sparse:
@@ -69,7 +73,6 @@ class LibSVMDataset(torch.utils.data.Dataset):
             x = torch.from_numpy(self.data[idx]).flatten()
         y = self.targets[idx]
 
-        # We may have to pad with zeros
         if self._dimensionality is not None:
             if len(x) < self._dimensionality:
                 x = torch.cat([x, torch.zeros([self._dimensionality - len(x)], dtype=x.dtype, device=x.device)])
@@ -307,6 +310,20 @@ class DistributedSampler(Sampler):
 
     def __len__(self):
         return len(self.indices)
+    
+class TestSampler(Sampler):
+    def __init__(self, length, max_length, seed):
+        super(TestSampler, self).__init__(length)
+        self.length = max_length
+        self.max_length = max_length
+        self.seed = seed
+        self.indices = torch.randperm(self.length, generator=torch.Generator().manual_seed(self.seed))[:self.max_length]
+
+    def __iter__(self):
+        return iter(self.indices.tolist())
+
+    def __len__(self):
+        return len(self.indices)
 
 ############################
 # Information logging
@@ -427,6 +444,7 @@ class Server:
                                           loss_name=loss_name, lr=lr, delay=num_workers-1, bs=batch_size)
         self.iteration = 1 #iteration starts from 1
         self.delay = 0 # delay factor: if train_type ='fixed', the delay factor = num_workers - 1
+        self.test_sampler = None
 
         # Load datasets and models
         self.train_dataset = load_data(dataset_name, dataset_path, 'train')
@@ -469,7 +487,7 @@ class Server:
                 raise ValueError("Unsupported training type. Use 'fixed' or 'random'.")
             if self.iteration % 1000 == 0:
                 print(f"Iteration: {self.iteration}, Current Worker ID: {self.current_worker_id}, Delay: {self.delay}")
-            if self.iteration % self.evaluation_time == 0:
+            if self.iteration % self.evaluation_time == 0 or self.iteration == self.iterations:
                 self.evaluation()
             self.iteration += 1
 
@@ -528,24 +546,22 @@ class Server:
 
     def evaluation(self):
         train_loss1 = self.evaluate(self.model1, self.train_dataset)
-        train_loss2 = self.evaluate(self.model2, self.train_dataset)
+        if self.train_dataset.num_samples <= 10*self.test_dataset.num_samples:
+            self.test_sampler = TestSampler(self.test_dataset.num_samples, max_length=self.train_dataset.num_samples, seed=self.iteration)
         test_loss1 = self.evaluate(self.model1, self.test_dataset)
-        test_loss2 = self.evaluate(self.model2, self.test_dataset)
         stability = self.stability_calculate()
-        avg_train_loss = (train_loss1 + train_loss2) / 2
-        avg_test_loss = (test_loss1 + test_loss2) / 2
-        print(f"Iteration: {self.iteration}, Delay: {self.delay:.0f}, Avg Train Loss: {avg_train_loss:.6f}, Avg Test Loss: {avg_test_loss:.6f}, Stability: {stability:.6f}")
-        self.logger.update(self.iteration, self.delay, avg_train_loss, avg_test_loss, stability)
-        self.datarecorder.update(self.iteration, self.delay, avg_train_loss, avg_test_loss, stability)
+        print(f"Iteration: {self.iteration}, Delay: {self.delay:.0f}, Train Loss: {train_loss1:.6f}, Test Loss: {test_loss1:.6f}, Stability: {stability:.6f}")
+        self.logger.update(self.iteration, self.delay, train_loss1, test_loss1, stability)
+        self.datarecorder.update(self.iteration, self.delay, train_loss1, test_loss1, stability)
         if self.iteration == self.iterations:
             self.datarecorder.save()
-            if test_loss1 < test_loss2:
-                self.checkpoint.save(self.model1, self.iteration, suffix='M1')
-            else:
-                self.checkpoint.save(self.model2, self.iteration, suffix='M2')
+            self.checkpoint.save(self.model1, self.iteration, suffix='M1')
 
     def evaluate(self, model, dataset):
-        dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
+        if self.test_sampler is None:
+            dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
+        else:
+            dataloader = DataLoader(dataset, batch_size=64, sampler=self.test_sampler)
         model.eval()
         total_loss = 0
         total = 0
@@ -632,15 +648,15 @@ if __name__ == "__main__":
     np.random.seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_type = 'fixed'  # or 'random' 
-    num_workers = 6
-    dataset_name = 'gisette'  # or 'rcv1', 'cifar10', 'mnist', 'gisette'
+    num_workers = 6  # Number of workers
+    dataset_name = 'rcv1'  # or 'rcv1', 'cifar10', 'mnist', 'gisette'
     dataset_path = './data'
-    model_name = 'linear_gisette' # or 'linear_rcv1', 'linear_gisette', 'fcnet_mnist'
+    model_name = 'linear_rcv1' # or 'linear_rcv1', 'linear_gisette', 'fcnet_mnist'
     loss_name = 'mse'  # or 'hingeloss'
-    lr = 2e-5
-    iterations = 6000
+    lr = 5e-3   #2e-5
+    iterations = 30000
     batch_size = 16
-    evaluation_time = 60  # Evaluate every 60 iterations
+    evaluation_time = 300  # Evaluate every 60 iterations
     log_dir = './logs'
     checkpoint_dir = './checkpoints'
     rec_dir = './records'
