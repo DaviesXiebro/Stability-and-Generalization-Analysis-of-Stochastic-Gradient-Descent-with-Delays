@@ -4,7 +4,6 @@ import os
 import re
 
 def extract_delay_lr(filename):
-    # 从文件名中提取 delay 和 lr 信息
     delay_match = re.search(r'delay(\d+)', filename)
     lr_match = re.search(r'lr(\d+)', filename)
     delay = int(delay_match.group(1)) if delay_match else None
@@ -19,13 +18,13 @@ def load_record_files(record_dir):
         if delay is not None and lr == 4:
             data = torch.load(os.path.join(record_dir, f))
             records.append((delay, lr, data))
-    records.sort(key=lambda x: (x[0]))  # 按delay排序
+    records.sort(key=lambda x: (x[0])) 
     return records
 
 def plot_curves(records):
     plt.figure(figsize=(18, 5))
 
-    # 训练损失
+    # Estimation error
     plt.subplot(1, 3, 1)
     for delay, lr, data in records:
         plt.plot(data['iteration'], [te - tr for te, tr in zip(data['test_loss'], data['train_loss'])], label=f'delay={delay}')
@@ -35,7 +34,7 @@ def plot_curves(records):
     # plt.ylim(0.05,0.25)
     plt.legend()
 
-    # 测试损失
+    # Test Loss
     plt.subplot(1, 3, 2)
     for delay, lr, data in records:
         plt.plot(data['iteration'], data['test_loss'], label=f'delay={delay}, lr={lr}')
@@ -61,4 +60,5 @@ def plot_curves(records):
 if __name__ == "__main__":
     record_dir = './pair_2/records'
     records = load_record_files(record_dir)
+
     plot_curves(records)
