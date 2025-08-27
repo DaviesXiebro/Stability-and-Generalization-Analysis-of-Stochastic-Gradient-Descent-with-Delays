@@ -1,3 +1,4 @@
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -291,7 +292,7 @@ def distribute_data(n_workers, neighbor_dataset, heter=True):
 
 class DistributedSampler(Sampler):
     def __init__(self, indices, worker_id=None, seed=0):
-        super(DistributedSampler, self).__init__(indices)
+        # super(DistributedSampler, self).__init__(indices)
         self.indices = indices
         self.worker_id = worker_id
         self.seed = seed
@@ -313,8 +314,8 @@ class DistributedSampler(Sampler):
     
 class TestSampler(Sampler):
     def __init__(self, length, max_length, seed):
-        super(TestSampler, self).__init__(length)
-        self.length = max_length
+        # super(TestSampler, self).__init__(length)
+        self.length = length
         self.max_length = max_length
         self.seed = seed
         self.indices = torch.randperm(self.length, generator=torch.Generator().manual_seed(self.seed))[:self.max_length]
@@ -386,7 +387,7 @@ class DataRecorder:
         self.rec_dir = rec_dir
         if not os.path.exists(rec_dir):
             os.makedirs(rec_dir)
-        self.filename = f"{model_name}_{dataset_name}_{loss_name}_lr{lr:.0e}_bs{bs}_delay{delay}.pth"
+        self.filename = f"{model_name}_{dataset_name}_{loss_name}_lr{lr:.0e}_bs{bs}_delay{delay}.pt"
         self.data = {'iteration': [],
                      'delay': [],
                      'train_loss': [],
@@ -406,14 +407,19 @@ class DataRecorder:
         print(f"Data saved to {filepath}")
 
 class ModelCheckpoint:
-    def __init__(self, checkpoint_dir, filename='model'):
+    def __init__(self, checkpoint_dir, model_name='', dataset_name='', loss_name='', lr=0.01, delay=0, bs=1):
         self.checkpoint_dir =  checkpoint_dir
         if not os.path.exists(checkpoint_dir):
             os.makedirs(checkpoint_dir)
-        self.filename = filename
+        self.model_name=model_name
+        self.dataset_name=dataset_name
+        self.loss_name=loss_name
+        self.lr=lr
+        self.delay=delay
+        self.bs=bs
 
-    def save(self, model, iteration, suffix=''):
-        self.filename= f"{self.filename}_iter{iteration}_{suffix}.pth"
+    def save(self, model, iteration):
+        self.filename= f"{self.model_name}_iter{iteration}_{self.dataset_name}_{self.loss_name}_lr{self.lr:.0e}_bs{self.bs}_delay{self.delay}.pt"
         self.filepath = os.path.join(self.checkpoint_dir, self.filename)
         torch.save(model.state_dict(), self.filepath)
         print(f"Model saved to {self.filepath} at iteration {iteration}")
@@ -439,12 +445,12 @@ class Server:
         self.batch_size = batch_size
         self.logger = Logger(log_dir, model_name=model_name, dataset_name=dataset_name,
                             loss_name=loss_name, lr=lr, delay=num_workers-1, bs=batch_size)
-        self.checkpoint = ModelCheckpoint(checkpoint_dir, model_name)
+        self.checkpoint = ModelCheckpoint(checkpoint_dir, model_name=model_name, dataset_name=dataset_name,
+                                          loss_name=loss_name, lr=lr, delay=num_workers-1, bs=batch_size)
         self.datarecorder = DataRecorder(rec_dir=rec_dir, model_name=model_name, dataset_name=dataset_name,
                                           loss_name=loss_name, lr=lr, delay=num_workers-1, bs=batch_size)
         self.iteration = 1 #iteration starts from 1
         self.delay = 0 # delay factor: if train_type ='fixed', the delay factor = num_workers - 1
-        self.test_sampler = None
 
         # Load datasets and models
         self.train_dataset = load_data(dataset_name, dataset_path, 'train')
@@ -545,23 +551,30 @@ class Server:
         selected_worker.gradient_calculate()
 
     def evaluation(self):
+        # slow evaluation
         train_loss1 = self.evaluate(self.model1, self.train_dataset)
         if self.train_dataset.num_samples <= 10*self.test_dataset.num_samples:
-            self.test_sampler = TestSampler(self.test_dataset.num_samples, max_length=self.train_dataset.num_samples, seed=self.iteration)
-        test_loss1 = self.evaluate(self.model1, self.test_dataset)
+            test_sampler = TestSampler(self.test_dataset.num_samples, max_length=self.train_dataset.num_samples, seed=self.iteration)
+        test_loss1 = self.evaluate(self.model1, self.test_dataset, test_sampler)
+
+        # #fast evaluation
+        # eval_tr_sampler = TestSampler(self.train_dataset.num_samples, max_length=10, seed=self.iteration)
+        # eval_te_sampler = TestSampler(self.test_dataset.num_samples, max_length=10, seed=self.iteration)
+        # train_loss1 = self.evaluate(self.model1, self.train_dataset, eval_tr_sampler)
+        # test_loss1 = self.evaluate(self.model1, self.test_dataset, eval_te_sampler)
         stability = self.stability_calculate()
         print(f"Iteration: {self.iteration}, Delay: {self.delay:.0f}, Train Loss: {train_loss1:.6f}, Test Loss: {test_loss1:.6f}, Stability: {stability:.6f}")
         self.logger.update(self.iteration, self.delay, train_loss1, test_loss1, stability)
         self.datarecorder.update(self.iteration, self.delay, train_loss1, test_loss1, stability)
         if self.iteration == self.iterations:
             self.datarecorder.save()
-            self.checkpoint.save(self.model1, self.iteration, suffix='M1')
+            self.checkpoint.save(self.model1, self.iteration)
 
-    def evaluate(self, model, dataset):
-        if self.test_sampler is None:
+    def evaluate(self, model, dataset, sampler=None):
+        if sampler is None:
             dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
         else:
-            dataloader = DataLoader(dataset, batch_size=64, sampler=self.test_sampler)
+            dataloader = DataLoader(dataset, batch_size=64, sampler=sampler)
         model.eval()
         total_loss = 0
         total = 0
@@ -644,26 +657,32 @@ class Worker:
 # Main function
 ############################
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    np.random.seed(42)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    torch.manual_seed(42+1)
+    np.random.seed(42+1)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_type = 'fixed'  # or 'random' 
-    num_workers = 6  # Number of workers
+    # num_workers = 41  # Number of workers
     dataset_name = 'rcv1'  # or 'rcv1', 'cifar10', 'mnist', 'gisette'
     dataset_path = './data'
     model_name = 'linear_rcv1' # or 'linear_rcv1', 'linear_gisette', 'fcnet_mnist'
     loss_name = 'mse'  # or 'hingeloss'
-    lr = 5e-3   #2e-5
+    lr = 1e-2   #2e-5
     iterations = 30000
-    batch_size = 16
-    evaluation_time = 300  # Evaluate every 60 iterations
-    log_dir = './logs'
-    checkpoint_dir = './checkpoints'
-    rec_dir = './records'
+    batch_size = 64
+    evaluation_time = 150  # Evaluate every 150 iterations
+    log_dir = './pair_2/logs'
+    checkpoint_dir = './pair_2/checkpoints'
+    rec_dir = './pair_2/records'
 
-
-    server = Server(device=device, train_type=train_type, num_workers=num_workers, batch_size=batch_size, dataset_name=dataset_name,
+    for num_workers in [121, 91, 61, 31, 1]:
+        server = Server(device=device, train_type=train_type, num_workers=num_workers, batch_size=batch_size, dataset_name=dataset_name,
                      dataset_path=dataset_path, model_name=model_name, loss_name=loss_name, lr=lr,
                      iterations=iterations, evaluation_time=evaluation_time, log_dir=log_dir,checkpoint_dir=checkpoint_dir,
                      rec_dir=rec_dir)
-    server.train()
+        server.train()
+        del server
+        gc.collect()
+        torch.cuda.empty_cache()
