@@ -5,7 +5,9 @@ This repository is the implementation of the section numerical experiments of pa
 
 A full version of stability and generalization analysis of Stochastic Gradient Descent with Delays.
 
-Supported Dataset: RCV1, GISETTE, MNIST
+Supported Dataset: RCV1, GISETTE, MNIST, ijcnn
+
+Support Loss Function: MSE Loss, q-norm Hinge Loss, CrossEntropy Loss
 
 Supported Algorithm: SGD with fixed delays
 
