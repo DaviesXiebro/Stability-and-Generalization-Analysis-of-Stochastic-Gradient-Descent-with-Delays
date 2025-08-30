@@ -356,8 +356,8 @@ class DistributedSampler(Sampler):
     def __iter__(self):
         seed = int(self.worker_id) * 10000 + int(self.seed)
         indices = torch.tensor(self.indices)
-        shuffled_indices = indices[torch.randperm(len(indices), generator=torch.Generator().manual_seed(seed))]
-        return iter(shuffled_indices.tolist())
+        self.shuffled_indices = indices[torch.randperm(len(indices), generator=torch.Generator().manual_seed(seed))]
+        return iter(self.shuffled_indices.tolist())
 
     def __len__(self):
         return len(self.indices)
@@ -670,12 +670,16 @@ class Worker:
 
     def next_data(self, model_name):
         try:
-            _ , (data, labels) = next(self.generators[model_name])
+            batch_idx , (data, labels) = next(self.generators[model_name])
         except StopIteration:
             self.samplers[model_name].update_seed()
             self.dataloaders[model_name] = DataLoader(self.server.train_dataset, batch_size=self.batch_size, sampler=self.samplers[model_name])
             self.generators[model_name] = enumerate(self.dataloaders[model_name])
-            _ , (data, labels) = next(self.generators[model_name])
+            batch_idx , (data, labels) = next(self.generators[model_name])
+        # batch_indices = self.dataloaders[model_name].batch_sampler.sampler.shuffled_indices[
+        #     batch_idx * self.batch_size : (batch_idx + 1) * self.batch_size
+        # ]
+        # print(f"Worker {self.worker_id}, Iteration {self.server.iteration}, Model {model_name}, Sample IDs: {batch_indices}")
 
         return data.to(self.device), labels.to(self.device)
 
@@ -697,6 +701,43 @@ class Worker:
 ############################
 # Main function
 ############################
+# if __name__ == "__main__":
+#     gc.collect()
+#     torch.cuda.empty_cache()
+
+#     torch.manual_seed(42)
+#     np.random.seed(42)
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
+#     train_type = 'fixed'  # or 'random' 
+#     n_pairs = 1  # Number of pairs of neighboring datasets
+#     # num_workers = 41  # Number of workers
+#     dataset_name = 'rcv1'  # or 'rcv1', 'cifar10', 'mnist', 'gisette', 'ijcnn'
+#     dataset_path = './data'
+#     model_name = 'linear_rcv1' # or 'linear_rcv1', 'linear_gisette', 'fcnet_mnist'
+#     loss_name = 'mse'  # or 'hingeloss'
+#     lr = 1e-2   #2e-5
+#     iterations = 30000
+#     batch_size = 16
+#     evaluation_time = 150  # Evaluate every 150 iterations
+#     random_seed =0
+#     log_dir_all = ['./rcv1/r1/logs', './rcv1/r2/logs', './rcv1/r3/logs', './rcv1/r4/logs']
+#     checkpoint_dir_all = ['./rcv1/r1/checkpoints','./rcv1/r2/checkpoints','./rcv1/r3/checkpoints','./rcv1/r4/checkpoints']
+#     rec_dir_all = ['./rcv1/r1/records', './rcv1/r2/records', './rcv1/r3/records', './rcv1/r4/records']
+
+#     for i in [0,1,2]:
+#         log_dir = log_dir_all[i]
+#         checkpoint_dir = checkpoint_dir_all[i]
+#         rec_dir = rec_dir_all[i]
+#         for num_workers in [2, 81, 61, 41, 21, 1]:
+#             server = Server(device=device, train_type=train_type, n_pairs=n_pairs, num_workers=num_workers, batch_size=batch_size, dataset_name=dataset_name,
+#                      dataset_path=dataset_path, model_name=model_name, loss_name=loss_name, lr=lr,
+#                      iterations=iterations, evaluation_time=evaluation_time, random_seed=random_seed, log_dir=log_dir,checkpoint_dir=checkpoint_dir,
+#                      rec_dir=rec_dir)
+#             server.train()
+#             del server
+#             gc.collect()
+#             torch.cuda.empty_cache()
+#         random_seed +=10
 if __name__ == "__main__":
     gc.collect()
     torch.cuda.empty_cache()
@@ -704,26 +745,26 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_type = 'fixed'  # or 'random' 
-    n_pairs = 10  # Number of pairs of neighboring datasets
+    train_type = 'fixed'  # or 'random'
+    n_pairs = 3  # Number of pairs of neighboring datasets
     # num_workers = 41  # Number of workers
-    dataset_name = 'rcv1'  # or 'rcv1', 'cifar10', 'mnist', 'gisette', 'ijcnn'
+    dataset_name = 'mnist'  # or 'rcv1', 'cifar10', 'mnist', 'gisette', 'ijcnn'
     dataset_path = './data'
-    model_name = 'linear_rcv1' # or 'linear_rcv1', 'linear_gisette', 'fcnet_mnist'
+    model_name = 'fcnet_mnist' # or 'linear_rcv1', 'linear_gisette', 'fcnet_mnist'
     loss_name = 'mse'  # or 'hingeloss'
     lr = 1e-2   #2e-5
-    iterations = 30000
+    iterations = 40000
     batch_size = 16
-    evaluation_time = 150  # Evaluate every 150 iterations
-    random_seed =0
-    log_dir_all = ['./rcv1/r1/logs', './rcv1/r2/logs', './rcv1/r3/logs', './rcv1/r4/logs']
-    checkpoint_dir_all = ['./rcv1/r1/checkpoints','./rcv1/r2/checkpoints','./rcv1/r3/checkpoints','./rcv1/r4/checkpoints']
-    rec_dir_all = ['./rcv1/r1/records', './rcv1/r2/records', './rcv1/r3/records', './rcv1/r4/records']
+    evaluation_time = 800  # Evaluate every 150 iterations
+    random_seed = 1
+    log_dir_all = ['./mnist/r1/logs', './mnist/r2/logs', './mnist/r3/logs', './mnist/r4/logs']
+    checkpoint_dir_all = ['./mnist/r1/checkpoints','./mnist/r2/checkpoints','./mnist/r3/checkpoints','./mnist/r4/checkpoints']
+    rec_dir_all = ['./mnist/r1/records', './mnist/r2/records', './mnist/r3/records', './mnist/r4/records']
     for i in [0,1,2]:
         log_dir = log_dir_all[i]
         checkpoint_dir = checkpoint_dir_all[i]
         rec_dir = rec_dir_all[i]
-        for num_workers in [201, 81, 61, 41, 21, 1]:
+        for num_workers in [41, 51, 61, 71]:
             server = Server(device=device, train_type=train_type, n_pairs=n_pairs, num_workers=num_workers, batch_size=batch_size, dataset_name=dataset_name,
                      dataset_path=dataset_path, model_name=model_name, loss_name=loss_name, lr=lr,
                      iterations=iterations, evaluation_time=evaluation_time, random_seed=random_seed, log_dir=log_dir,checkpoint_dir=checkpoint_dir,
@@ -733,19 +774,3 @@ if __name__ == "__main__":
             gc.collect()
             torch.cuda.empty_cache()
         random_seed +=10
-    # n_pairs = 10  # Number of pairs of neighboring datasets
-    # # num_workers = 41  # Number of workers
-    # dataset_name = 'gisette'  # or 'rcv1', 'cifar10', 'mnist', 'gisette'
-    # dataset_path = './data'
-    # model_name = 'linear_gisette' # or 'linear_rcv1', 'linear_gisette', 'fcnet_mnist'
-    # loss_name = 'mse'  # or 'hingeloss'
-    # lr = 1e-5   #2e-5
-    # iterations = 5000
-    # batch_size = 16
-    # evaluation_time = 10  # Evaluate every 10 iterations
-    # random_seed = 0
-    # log_dir = './gisette/r1/logs'
-    # checkpoint_dir = './gisette/r1/checkpoints'
-    # rec_dir = './gisette/r1/records'
-
-    # for num_workers in [21, 16, 11, 6, 1]:
